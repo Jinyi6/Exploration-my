@@ -37,7 +37,6 @@ from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_in
 from verl.workers.critic import BasePPOCritic
 from verl.utils.risk_functional import compute_rho_from_dist
 
-
 __all__ = ["DataParallelPPOCritic"]
 
 logger = logging.getLogger(__file__)
@@ -242,19 +241,20 @@ class DataParallelPPOCritic(BasePPOCritic):
                 taus = None
         else:
             values = torch.concat(values_lst, dim=0)
+
         responses = data.batch["responses"]
         attention_mask = data.batch["attention_mask"]
         response_length = responses.size(1)
         #values = values * attention_mask[:, -response_length - 1 : -1]
         response_mask = attention_mask[:, -response_length - 1 : -1]
         if self.is_distributional:
-            risk_apply_to = self.config.algorithm.get("risk_apply_to", "none")
-            risk_level = self.config.algorithm.get("risk_level", "neutral")
-            
+            risk_apply_to = self.config.get("risk_apply_to", "none")
+            risk_level = self.config.get("risk_level", "neutral")
+
             # If standard mean based, existing path (or neutral)
             # If risk active: compute rho(Z)
             use_risk = (risk_apply_to in ["baseline", "target"]) and (risk_level != "neutral")
-            
+
             if use_risk:
                 dist_type = "c51" if self.quantile_mode == "c51" else "quantile"
                 if dist_type == "c51":
@@ -304,6 +304,11 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = {}
 
         select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        if self.is_distributional and self.quantile_mode == "iqn":
+            # pull optional target quantiles/taus if available
+            for key in ["target_quantiles", "target_taus"]:
+                if key in data.batch.keys():
+                    select_keys.append(key)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -365,6 +370,14 @@ class DataParallelPPOCritic(BasePPOCritic):
                                 self.c51_v_min, self.c51_v_max, self.num_quantiles,
                                 device=vpreds.device, dtype=vpreds.dtype
                             )
+                            append_to_dict(
+                                metrics,{
+                                    "critic/atoms_min": atoms.min().item(),
+                                    "critic/atoms_max": atoms.max().item(),
+                                    "critic/atoms_var": atoms.var(unbiased=False).item(),
+                                    "critic/atoms_std": atoms.std(unbiased=False).item(),
+                                },
+                            )
                             vf_loss = core_algos.compute_categorical_value_loss(
                                 logits=vpreds,
                                 returns=returns,
@@ -377,7 +390,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                             vpred_mean = masked_mean(expect, response_mask).detach().item()
                             vf_clipfrac = torch.tensor(0.0, device=vpreds.device)
                         else:
-                            # IQN or Fixed Quantile Regression
+                            #iqn or qrdqn
                             vpreds, taus = vpreds
                             quantile_mask = response_mask.unsqueeze(-1).bool()
                             flat_quantiles = torch.masked_select(vpreds.detach(), quantile_mask)

@@ -140,6 +140,8 @@ critic:
   num_quantiles: 32
   quantile_mode: iqn  # iqn | fixed
   quantile_huber_kappa: 1.0
+  risk_apply_to: "none" # "none" | "baseline" | "target"
+  risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"
   optim:
     lr: 1e-5
     lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
@@ -220,7 +222,6 @@ algorithm:
     horizon: 10000
     target_kl: 0.1
   risk_apply_to: "none" # "none" | "baseline" | "target"
-  risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"
 
 trainer:
   balance_batch: True

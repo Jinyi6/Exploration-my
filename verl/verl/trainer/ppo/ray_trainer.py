@@ -202,13 +202,13 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         # Simplified version: returns = rho(Z_last) broadcasted.
         rho = data.batch["values"]  # (B, T)
         response_mask = data.batch["response_mask"]
-        
+
         # Take the value at the last valid token of response? 
         # Actually values is already masked by response_mask in critic?
         # In dp_critic: values = values * response_mask
         # So invalid steps are 0.
         # But we want the value at the *end* of the episode (or end of response).
-        
+
         # We can sum values / sum(mask) ? No, that's average risk over path.
         # Usually risk is defined on the Return Z.
         # Critic estimates rho(Z_t).
@@ -216,27 +216,27 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         # But PPO updates policy at all steps.
         # Should we use rho(Z_t) as target for step t?
         # "returns = rho_seq" in prompt implies using the risk value as the return.
-        
+
         # Prompt: "rho_seq = rho(Z(s_last)) ... returns = rho_seq.unsqueeze(-1)..."
         # So we take the LAST value.
-        
+
         # rho is (B, T). We want (B,) from the last step.
         # How to find last step efficiently? argmax over mask?
         # Actually simplest is just take the last element if we know it corresponds to EOS?
         # But padding...
         # response_mask has 1s then 0s.
         # Last valid index: response_mask.sum(1) - 1.
-        
+
         last_indices = response_mask.sum(1).long() - 1
         last_indices = last_indices.clamp(min=0) # handle empty?
-        
+
         # gather
         # rho: (B, T)
         rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1) # (B,)
-        
+
         returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
         advantages = returns # REINFORCE-like with risk return
-        
+
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         return data
