@@ -253,7 +253,8 @@ class DataParallelPPOCritic(BasePPOCritic):
 
             # If standard mean based, existing path (or neutral)
             # If risk active: compute rho(Z)
-            use_risk = (risk_apply_to in ["baseline", "target"]) and (risk_level != "neutral")
+            # NOTE: also treat "target1" / "baseline1" as risk-enabled modes for distributional critic.
+            use_risk = (risk_apply_to in ["baseline", "target", "target1", "baseline1"]) and (risk_level != "neutral")
 
             if use_risk:
                 dist_type = "c51" if self.quantile_mode == "c51" else "quantile"

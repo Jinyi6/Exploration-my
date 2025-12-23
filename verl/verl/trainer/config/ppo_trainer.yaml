@@ -140,7 +140,7 @@ critic:
   num_quantiles: 32
   quantile_mode: iqn  # iqn | fixed
   quantile_huber_kappa: 1.0
-  risk_apply_to: "none" # "none" | "baseline" | "target"
+  risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1"
   risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"
   optim:
     lr: 1e-5
@@ -221,7 +221,11 @@ algorithm:
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
-  risk_apply_to: "none" # "none" | "baseline" | "target"
+  risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1"
+  # baseline shaping options for risk-sensitive PPO
+  # only used when risk_apply_to is "target1" or "baseline1"
+  baseline_mode: "none"    # "none" | "neutral" | "risk" | "mix"
+  baseline_mix_beta: 0.5   # mixing coefficient when baseline_mode == "mix"
 
 trainer:
   balance_batch: True

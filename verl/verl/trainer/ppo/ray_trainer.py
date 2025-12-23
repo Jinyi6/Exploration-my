@@ -59,7 +59,7 @@ from verl.trainer.ppo.metric_utils_passk import evaluate_passk_distribution
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, masked_whiten
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
@@ -189,19 +189,32 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, risk_apply_to="none"):
+def compute_advantage(
+    data: DataProto,
+    adv_estimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    multi_turn: bool = False,
+    norm_adv_by_std_in_grpo: bool = True,
+    risk_apply_to: str = "none",
+    baseline_mode: str = "none",
+    baseline_mix_beta: float = 0.5,
+):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
-    # prepare response group
-    # TODO: add other ways to estimate advantages
+    response_mask = data.batch["response_mask"]
+
+    # === legacy target 模式（保持向后兼容，不改内部实现）===
+    # 注意：该分支会用 critic 的 values 直接覆盖 returns，存在“risk-of-risk”自闭环问题。
+    # 为兼容旧实验，仅在 risk_apply_to == "target" 时保留原行为。
     if risk_apply_to == "target":
         # Risk-sensitive target mode: optimize E[rho(Z)] directly.
         # Critic returns rho(Z) in "values".
         # We take rho(Z) at the last step (or aggregating) and define it as the return.
         # Simplified version: returns = rho(Z_last) broadcasted.
         rho = data.batch["values"]  # (B, T)
-        response_mask = data.batch["response_mask"]
 
         # Take the value at the last valid token of response? 
         # Actually values is already masked by response_mask in critic?
@@ -241,28 +254,25 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["returns"] = returns
         return data
 
+    # === Step 1：先按标准 PPO 方式计算基础 advantages / returns（不带新的 risk 逻辑）===
     if adv_estimator == AdvantageEstimator.PASSKTRAINING:
         advantages, returns = core_algos.compute_passktraining_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             index=data.batch["group_id"],
             K=4,
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GAE:
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             gamma=gamma,
             lam=lam,
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GRPO:
         # TODO: test on more adv estimator type
-        grpo_calculation_mask = data.batch["response_mask"]
+        grpo_calculation_mask = response_mask
         if multi_turn:
             # If multi-turn, replace the mask with the relevant part of loss_mask
             response_length = grpo_calculation_mask.size(1)  # Get length from the initial response mask
@@ -274,65 +284,103 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE:
         advantages, returns = core_algos.compute_reinforce_plus_plus_baseline_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             index=data.non_tensor_batch["uid"],
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS:
         advantages, returns = core_algos.compute_reinforce_plus_plus_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             gamma=gamma,
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.REMAX:
         advantages, returns = core_algos.compute_remax_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             reward_baselines=data.batch["reward_baselines"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
         )
 
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.RLOO:
         advantages, returns = core_algos.compute_rloo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             index=data.non_tensor_batch["uid"],
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.QAE:
         # TODO: test on more adv estimator type
         advantages, returns = core_algos.compute_qae_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             index=data.non_tensor_batch["uid"],
             quantile_K=data.meta_info.get("quantile_K", 0.4),
             eps=data.meta_info.get("eps", 1e-8),
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.QUANTILE:
         # TODO: test on more adv estimator type
         advantages, returns = core_algos.compute_quantile_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask,
             index=data.non_tensor_batch["uid"],
             quantile_K=data.meta_info.get("quantile_K", 0.75),
             eps=data.meta_info.get("eps", 1e-8),
         )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     else:
         raise NotImplementedError
+
+    # 先写回基础 advantages / returns，供 critic 训练使用
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = returns
+
+    # === Step 2：在基础 returns 上做风险敏感的 advantage reshaping ===
+    # 说明：
+    # - 为了避免“risk-of-risk”闭环，新模式仅修改 advantages，不再覆盖 returns。
+    # - 只对 GAE 场景做风险化；其它 adv_estimator 维持原样。
+    if adv_estimator != AdvantageEstimator.GAE:
+        return data
+
+    # baseline1: 只修改 advantage 的 baseline，不影响 GAE TD 递推（returns 保持不变）
+    if risk_apply_to == "baseline1":
+        # 使用 GAE 得到的 returns 作为 G_t
+        G = returns  # (B, T)
+        # baseline 来自 critic 的 values；risk / neutral 由 critic.risk_apply_to 决定
+        if baseline_mode == "none":
+            b = torch.zeros_like(G)
+        else:
+            b = data.batch["values"] * response_mask
+
+        raw_adv = (G - b) * response_mask
+        reshaped_adv = masked_whiten(raw_adv, response_mask)
+        data.batch["advantages"] = reshaped_adv
+        # returns 不变，用于 critic 训练
+        return data
+
+    # target1: risk 目标只用于 actor 的 advantage，critic 仍用真实 returns 训练
+    if risk_apply_to == "target1":
+        values = data.batch["values"]  # (B, T)
+        # 复用 legacy target 的“末 token 取值”作为风险目标 G_risk
+        last_indices = response_mask.sum(1).long() - 1
+        last_indices = last_indices.clamp(min=0)
+        rho_last = values.gather(1, last_indices.unsqueeze(1)).squeeze(1)  # (B,)
+        risk_returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
+
+        # baseline：使用 critic 输出作为 b(s)，是否风险 / 中性由 critic.risk_apply_to 决定
+        if baseline_mode == "none":
+            b = torch.zeros_like(risk_returns)
+        else:
+            b = values * response_mask
+
+        raw_adv = (risk_returns - b) * response_mask
+        reshaped_adv = masked_whiten(raw_adv, response_mask)
+
+        data.batch["advantages"] = reshaped_adv
+        # critic 仍然用上面的 returns（由 GAE 计算）进行训练
+        # 额外存储风险目标，便于后续分析 / 可视化
+        data.batch["risk_returns"] = risk_returns
+        return data
+
     return data
 
 
@@ -1383,6 +1431,8 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             risk_apply_to=self.config.algorithm.get("risk_apply_to", "none"),
+                            baseline_mode=self.config.algorithm.get("baseline_mode", "none"),
+                            baseline_mix_beta=self.config.algorithm.get("baseline_mix_beta", 0.5),
                         ) # type: ignore
 
                     # update critic
