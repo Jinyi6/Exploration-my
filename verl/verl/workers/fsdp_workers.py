@@ -1072,7 +1072,11 @@ class CriticWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={"values": values})
+            # critic may return either a tensor (legacy) or a DataProto (with extra fields)
+            if isinstance(values, DataProto):
+                output = values
+            else:
+                output = DataProto.from_dict(tensors={"values": values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         output = output.to("cpu")

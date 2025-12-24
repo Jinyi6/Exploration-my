@@ -196,7 +196,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         return grad_norm
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
-    def compute_values(self, data: DataProto) -> torch.Tensor:
+    def compute_values(self, data: DataProto) -> DataProto:
         self.critic_module.eval()
         micro_batch_size = data.meta_info["micro_batch_size"]
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
@@ -222,19 +222,23 @@ class DataParallelPPOCritic(BasePPOCritic):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
-                values = self._forward_micro_batch(micro_batch) # return (quan, taus)
+                values = self._forward_micro_batch(micro_batch)
             values_lst.append(values)
+
+        # Merge micro-batch outputs
         if self.is_distributional:
-            # tolerate any extra items while only keeping quantiles
-            quantiles = []
+            # tolerate any extra items while only keeping quantiles / logits
+            quantiles_or_logits = []
             for item in values_lst:
                 if isinstance(item, (tuple, list)):
-                    quantiles.append(item[0]) # item(quan, taus) quan
+                    # item is (quantiles, taus) for IQN / fixed
+                    quantiles_or_logits.append(item[0])
                     if item[1] is not None:
                         taus_lst.append(item[1])
                 else:
-                    quantiles.append(item)
-            values = torch.concat(quantiles, dim=0)
+                    # item is quantiles (fixed grid) or logits (C51)
+                    quantiles_or_logits.append(item)
+            values = torch.concat(quantiles_or_logits, dim=0)
             if len(taus_lst) > 0:
                 taus = torch.concat(taus_lst, dim=0)
             else:
@@ -245,46 +249,27 @@ class DataParallelPPOCritic(BasePPOCritic):
         responses = data.batch["responses"]
         attention_mask = data.batch["attention_mask"]
         response_length = responses.size(1)
-        #values = values * attention_mask[:, -response_length - 1 : -1]
         response_mask = attention_mask[:, -response_length - 1 : -1]
+
+        # Distributional critic: always return risk-neutral expectation E[Z]
+        # Non-distributional critic: pass through scalar values.
         if self.is_distributional:
-            risk_apply_to = self.config.get("risk_apply_to", "none")
-            risk_level = self.config.get("risk_level", "neutral")
-
-            # If standard mean based, existing path (or neutral)
-            # If risk active: compute rho(Z)
-            # NOTE: also treat "target1" / "baseline1" as risk-enabled modes for distributional critic.
-            use_risk = (risk_apply_to in ["baseline", "target", "target1", "baseline1"]) and (risk_level != "neutral")
-
-            if use_risk:
-                dist_type = "c51" if self.quantile_mode == "c51" else "quantile"
-                if dist_type == "c51":
-                    atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
-                    values = compute_rho_from_dist(dist_type="c51", vpreds_or_logits=values, taus_or_atoms=atoms, risk_level=risk_level)
-                    # values is now (Batch, T)
-                    values = values * response_mask
-                    values_mean = values
-                else:
-                    # IQN / Fixed
-                    # If IQN, we have taus (collected above).
-                    # If Fixed, taus is None, we need to generate fixed grid.
-                    if taus is None:
-                        k = values.size(-1)
-                        # (K,)
-                        taus = (torch.arange(k, device=values.device, dtype=values.dtype) + 0.5) / k
-                    values = compute_rho_from_dist(dist_type="quantile", vpreds_or_logits=values, taus_or_atoms=taus, risk_level=risk_level)
-                    values = values * response_mask
-                    values_mean = values
+            if self.quantile_mode == "c51":
+                # values are logits over atoms
+                probs = torch.softmax(values, dim=-1)
+                atoms = torch.linspace(
+                    self.c51_v_min,
+                    self.c51_v_max,
+                    values.size(-1),
+                    device=values.device,
+                    dtype=values.dtype,
+                )
+                expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
+                values_mean = expect * response_mask
             else:
-                if self.quantile_mode == "c51":
-                    atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
-                    probs = torch.softmax(values, dim=-1)
-                    expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
-                    values = expect * response_mask
-                    values_mean = values
-                else:
-                    values = values * response_mask.unsqueeze(-1)
-                    values_mean = values.mean(dim=-1)
+                # IQN / fixed quantile: values are quantiles (B, T, K)
+                values = values * response_mask.unsqueeze(-1)
+                values_mean = values.mean(dim=-1)
         else:
             values = values * response_mask
             values_mean = values
@@ -295,8 +280,32 @@ class DataParallelPPOCritic(BasePPOCritic):
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             values = values[revert_indices]
             values_mean = values_mean[revert_indices]
+            # keep taus aligned with values when using dynamic bsz
+            if self.is_distributional and "taus" in locals() and taus is not None:
+                taus = taus[revert_indices]
 
-        return values_mean
+        # Package outputs for trainer:
+        # - values: risk-neutral baseline E[Z]
+        # - optional distribution fields for risk computation on actor side
+        tensors = {"values": values_mean}
+        if self.is_distributional:
+            if self.quantile_mode == "c51":
+                tensors["value_logits"] = values  # (B, T, K)
+                # atoms are deterministic from config; create here for trainer usage
+                atoms = torch.linspace(
+                    self.c51_v_min,
+                    self.c51_v_max,
+                    values.size(-1),
+                    device=values.device,
+                    dtype=values.dtype,
+                )
+                tensors["value_atoms"] = atoms
+            else:
+                tensors["value_quantiles"] = values  # (B, T, K) masked on response
+                if taus is not None:
+                    tensors["value_taus"] = taus
+
+        return DataProto.from_dict(tensors=tensors)
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def update_critic(self, data: DataProto):

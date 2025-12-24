@@ -222,9 +222,10 @@ algorithm:
     horizon: 10000
     target_kl: 0.1
   risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1"
-  # baseline shaping options for risk-sensitive PPO
+  risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_α" | "cvar_upper_α"
+  # baseline / advantage shaping options for risk-sensitive PPO
   # only used when risk_apply_to is "target1" or "baseline1"
-  baseline_mode: "none"    # "none" | "neutral" | "risk" | "mix"
+  baseline_mode: "none"    # "none" | "neutral" | "risk" | "mix" | "reweight"
   baseline_mix_beta: 0.5   # mixing coefficient when baseline_mode == "mix"
 
 trainer:

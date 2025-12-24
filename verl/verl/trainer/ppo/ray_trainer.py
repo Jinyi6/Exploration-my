@@ -62,6 +62,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean, masked_whiten
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
+from verl.utils.risk_functional import compute_rho_from_dist, parse_risk_level
 
 WorkerType = Type[Worker]
 
@@ -200,6 +201,7 @@ def compute_advantage(
     risk_apply_to: str = "none",
     baseline_mode: str = "none",
     baseline_mix_beta: float = 0.5,
+    risk_level: str = "neutral",
 ):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
@@ -341,44 +343,171 @@ def compute_advantage(
     if adv_estimator != AdvantageEstimator.GAE:
         return data
 
-    # baseline1: 只修改 advantage 的 baseline，不影响 GAE TD 递推（returns 保持不变）
-    if risk_apply_to == "baseline1":
-        # 使用 GAE 得到的 returns 作为 G_t
-        G = returns  # (B, T)
-        # baseline 来自 critic 的 values；risk / neutral 由 critic.risk_apply_to 决定
-        if baseline_mode == "none":
-            b = torch.zeros_like(G)
-        else:
-            b = data.batch["values"] * response_mask
+    # === Step 2b：如果没有风险需求，直接返回 ===
+    if risk_apply_to not in ["baseline1", "target1"]:
+        return data
 
+    # === Step 2c：从 Critic 输出中恢复分布，计算 rho(Z)（如果可用） ===
+    # Fallback：若没有分布信息，则退化为 risk-neutral（rho = values）
+    values_neutral = data.batch["values"]  # (B, T), E[Z]
+    rho = values_neutral
+
+    # 检查是否有分布信息（仅在 distributional critic + FSDP 路径下会存在）
+    if "value_logits" in data.batch and "value_atoms" in data.batch:
+        # C51 路径
+        logits = data.batch["value_logits"]  # (B, T, K)
+        atoms = data.batch["value_atoms"]    # (K,)
+        rho = compute_rho_from_dist(
+            dist_type="c51",
+            vpreds_or_logits=logits,
+            taus_or_atoms=atoms,
+            risk_level=risk_level,
+        )  # (B, T)
+    elif "value_quantiles" in data.batch:
+        # IQN / fixed quantile 路径
+        quantiles = data.batch["value_quantiles"]  # (B, T, K)
+        taus = data.batch.get("value_taus", None)
+        rho = compute_rho_from_dist(
+            dist_type="quantile",
+            vpreds_or_logits=quantiles,
+            taus_or_atoms=taus,
+            risk_level=risk_level,
+        )  # (B, T)
+
+    rho = rho * response_mask  # 仅作用在 response 区间
+
+    # baseline 组合：neutral / risk / mix
+    def _build_baseline(target_like: torch.Tensor) -> torch.Tensor:
+        if baseline_mode == "none":
+            return torch.zeros_like(target_like)
+
+        b_neutral = values_neutral * response_mask
+        b_risk = rho
+
+        if baseline_mode == "neutral":
+            return b_neutral
+        if baseline_mode == "risk":
+            return b_risk
+        if baseline_mode == "mix":
+            beta = baseline_mix_beta
+            return beta * b_neutral + (1.0 - beta) * b_risk
+        raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
+
+    # baseline1: 只修改 advantage 的 baseline / 权重，不影响 GAE TD 递推（returns 保持不变）
+    if risk_apply_to == "baseline1":
+        G = returns  # (B, T), risk-neutral GAE target
+
+        # baseline_mode == "reweight": Tail Reweighting A_t = w_t * (G_t - V(s_t))
+        if baseline_mode == "reweight":
+            # 默认 baseline 使用 risk-neutral V(s) = values
+            b = values_neutral * response_mask
+
+            # 默认权重 w_t = 1（退化为标准 GAE）
+            w = torch.ones_like(G)
+
+            # 仅在有分布信息且 risk_level 非 neutral 时才进行 tail reweighting
+            try:
+                kind, alpha = parse_risk_level(risk_level)
+            except ValueError:
+                kind, alpha = "mean", None
+
+            has_quantiles = "value_quantiles" in data.batch
+            has_c51 = ("value_logits" in data.batch) and ("value_atoms" in data.batch)
+
+            if kind != "mean" and alpha is not None and (has_quantiles or has_c51):
+                target_tail = "upper" if kind == "cvar_upper" else "lower"
+
+                # --- 估计 tail 分位点 q_{tail}(s_t) ---
+                if has_quantiles:
+                    quantiles = data.batch["value_quantiles"]  # (B, T, K)
+                    K = quantiles.size(-1)
+                    device = quantiles.device
+                    dtype = quantiles.dtype
+
+                    if "value_taus" in data.batch:
+                        taus = data.batch["value_taus"]
+                        if taus.dim() == 1:
+                            taus = taus.view(1, 1, -1)
+                    else:
+                        taus = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
+                        taus = taus.view(1, 1, -1)
+
+                    target_tau = 1.0 - alpha if target_tail == "upper" else alpha
+                    diff = torch.abs(taus - target_tau)
+                    k_star = diff.argmin(dim=-1)  # (B, T)
+                    q_tail = quantiles.gather(-1, k_star.unsqueeze(-1)).squeeze(-1)  # (B, T)
+                else:
+                    # C51：用 CDF 近似分位点
+                    logits = data.batch["value_logits"]  # (B, T, K)
+                    atoms = data.batch["value_atoms"]    # (K,)
+                    probs = torch.softmax(logits, dim=-1)
+                    cdf = probs.cumsum(dim=-1)
+                    target_p = 1.0 - alpha if target_tail == "upper" else alpha
+                    mask_cdf = cdf >= target_p
+                    idx = mask_cdf.long().argmax(dim=-1)  # (B, T)
+                    atoms_expand = atoms.view(1, 1, -1)
+                    q_tail = atoms_expand.gather(-1, idx.unsqueeze(-1)).squeeze(-1)  # (B, T)
+
+                # --- 构造软权重 w_t，支持平滑、归一化与裁剪 ---
+                reweight_cfg = data.meta_info.get("tail_reweight_cfg", {})
+                soft_beta = float(reweight_cfg.get("soft_beta", 0.5))
+                clip_min = float(reweight_cfg.get("clip_min", 0.1))
+                clip_max = float(reweight_cfg.get("clip_max", 10.0))
+
+                # 软门控：sigma((G - q)/beta) / sigma((q - G)/beta)
+                if target_tail == "upper":
+                    gate_scores = torch.sigmoid((G - q_tail) / max(soft_beta, 1e-6))
+                else:
+                    gate_scores = torch.sigmoid((q_tail - G) / max(soft_beta, 1e-6))
+                w = gate_scores / (alpha + 1e-8)
+
+                # 权重归一化：保持 response 区间内 E[w] ≈ 1
+                masked_w = w * response_mask
+                valid_cnt = response_mask.sum().clamp(min=1.0).to(masked_w.dtype)
+                w_mean = masked_w.sum() / valid_cnt
+                w = w / (w_mean + 1e-8)
+
+                # 权重裁剪，避免极端梯度
+                w = torch.clamp(w, min=clip_min, max=clip_max)
+
+                # 记录监控指标，便于观察尾部样本占比
+                tail_active = (gate_scores * response_mask > 0.5).float().sum() / valid_cnt
+                final_masked_w = w * response_mask
+                final_mean = final_masked_w.sum() / valid_cnt
+                w_std = torch.sqrt(((final_masked_w - final_mean * response_mask) ** 2).sum() / valid_cnt + 1e-8)
+                adv_metrics = data.meta_info.setdefault("adv_metrics", {})
+                adv_metrics["adv/reweight_tail_frac"] = float(tail_active.detach().item())
+                adv_metrics["adv/reweight_weight_mean"] = float(final_mean.detach().item())
+                adv_metrics["adv/reweight_weight_std"] = float(w_std.detach().item())
+
+            w = w * response_mask
+            raw_adv = w * (G - b) * response_mask
+            reshaped_adv = masked_whiten(raw_adv, response_mask)
+            data.batch["advantages"] = reshaped_adv
+            data.batch["adv_weights"] = w
+            return data
+
+        # 其它 baseline_mode 沿用 risk-neutral / risk / mix baseline
+        b = _build_baseline(G)
         raw_adv = (G - b) * response_mask
         reshaped_adv = masked_whiten(raw_adv, response_mask)
         data.batch["advantages"] = reshaped_adv
-        # returns 不变，用于 critic 训练
         return data
 
-    # target1: risk 目标只用于 actor 的 advantage，critic 仍用真实 returns 训练
+    # target1: 使用 rho(Z) 构造风险目标 G_risk，仅作用在 actor 的 advantage
     if risk_apply_to == "target1":
-        values = data.batch["values"]  # (B, T)
-        # 复用 legacy target 的“末 token 取值”作为风险目标 G_risk
+        # 复用 legacy target 的“末 token 取值”作为 G_risk
         last_indices = response_mask.sum(1).long() - 1
         last_indices = last_indices.clamp(min=0)
-        rho_last = values.gather(1, last_indices.unsqueeze(1)).squeeze(1)  # (B,)
+        rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1)  # (B,)
         risk_returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
 
-        # baseline：使用 critic 输出作为 b(s)，是否风险 / 中性由 critic.risk_apply_to 决定
-        if baseline_mode == "none":
-            b = torch.zeros_like(risk_returns)
-        else:
-            b = values * response_mask
-
+        b = _build_baseline(risk_returns)
         raw_adv = (risk_returns - b) * response_mask
         reshaped_adv = masked_whiten(raw_adv, response_mask)
 
         data.batch["advantages"] = reshaped_adv
-        # critic 仍然用上面的 returns（由 GAE 计算）进行训练
-        # 额外存储风险目标，便于后续分析 / 可视化
-        data.batch["risk_returns"] = risk_returns
+        data.batch["risk_returns"] = risk_returns  # 仅用于分析 / 可视化
         return data
 
     return data
@@ -1433,6 +1562,7 @@ class RayPPOTrainer:
                             risk_apply_to=self.config.algorithm.get("risk_apply_to", "none"),
                             baseline_mode=self.config.algorithm.get("baseline_mode", "none"),
                             baseline_mix_beta=self.config.algorithm.get("baseline_mix_beta", 0.5),
+                            risk_level=self.config.algorithm.get("risk_level", "neutral"),
                         ) # type: ignore
 
                     # update critic
