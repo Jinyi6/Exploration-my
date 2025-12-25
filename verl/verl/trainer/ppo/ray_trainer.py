@@ -1580,6 +1580,7 @@ class RayPPOTrainer:
                             baseline_mix_beta=self.config.algorithm.get("baseline_mix_beta", 0.5),
                             risk_level=self.config.algorithm.get("risk_level", "neutral"),
                         ) # type: ignore
+                        metrics.update(batch.meta_info.get("adv_metrics", {}))
 
                     # update critic
                     if self.use_critic:
