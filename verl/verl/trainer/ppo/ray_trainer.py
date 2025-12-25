@@ -199,7 +199,7 @@ def compute_advantage(
     multi_turn: bool = False,
     norm_adv_by_std_in_grpo: bool = True,
     risk_apply_to: str = "none",
-    baseline_mode: str = "none",
+    baseline_mode: str = "no_baseline",
     baseline_mix_beta: float = 0.5,
     risk_level: str = "neutral",
 ):
@@ -351,12 +351,14 @@ def compute_advantage(
     # Fallback：若没有分布信息，则退化为 risk-neutral（rho = values）
     values_neutral = data.batch["values"]  # (B, T), E[Z]
     rho = values_neutral
+    has_distributional_info = False
 
     # 检查是否有分布信息（仅在 distributional critic + FSDP 路径下会存在）
     if "value_logits" in data.batch and "value_atoms" in data.batch:
         # C51 路径
         logits = data.batch["value_logits"]  # (B, T, K)
         atoms = data.batch["value_atoms"]    # (K,)
+        has_distributional_info = True
         rho = compute_rho_from_dist(
             dist_type="c51",
             vpreds_or_logits=logits,
@@ -367,6 +369,14 @@ def compute_advantage(
         # IQN / fixed quantile 路径
         quantiles = data.batch["value_quantiles"]  # (B, T, K)
         taus = data.batch.get("value_taus", None)
+        if taus is None:
+            # Fixed-quantile critic不会吐 taus，这里构造一个固定 mid-point 网格
+            K = quantiles.size(-1)
+            device = quantiles.device
+            dtype = quantiles.dtype
+            taus = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
+            taus = taus.view(1, 1, -1)
+        has_distributional_info = True
         rho = compute_rho_from_dist(
             dist_type="quantile",
             vpreds_or_logits=quantiles,
@@ -378,7 +388,7 @@ def compute_advantage(
 
     # baseline 组合：neutral / risk / mix
     def _build_baseline(target_like: torch.Tensor) -> torch.Tensor:
-        if baseline_mode == "none":
+        if baseline_mode == "no_baseline":
             return torch.zeros_like(target_like)
 
         b_neutral = values_neutral * response_mask
@@ -496,6 +506,12 @@ def compute_advantage(
 
     # target1: 使用 rho(Z) 构造风险目标 G_risk，仅作用在 actor 的 advantage
     if risk_apply_to == "target1":
+        if not has_distributional_info:
+            raise ValueError(
+                "algorithm.risk_apply_to=target1 requires a distributional critic output "
+                "(value_logits/value_atoms or value_quantiles). "
+                "Please enable critic.distributional or switch risk_apply_to away from target1."
+            )
         # 复用 legacy target 的“末 token 取值”作为 G_risk
         last_indices = response_mask.sum(1).long() - 1
         last_indices = last_indices.clamp(min=0)
@@ -1560,7 +1576,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             risk_apply_to=self.config.algorithm.get("risk_apply_to", "none"),
-                            baseline_mode=self.config.algorithm.get("baseline_mode", "none"),
+                            baseline_mode=self.config.algorithm.get("baseline_mode", "no_baseline"),
                             baseline_mix_beta=self.config.algorithm.get("baseline_mix_beta", 0.5),
                             risk_level=self.config.algorithm.get("risk_level", "neutral"),
                         ) # type: ignore

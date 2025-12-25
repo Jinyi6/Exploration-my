@@ -60,6 +60,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                 raise AttributeError("Quantile mode c51 requires critic_module.c51_head for categorical C51.")
             if self.quantile_mode not in ["fixed", "c51"] and not hasattr(self.critic_module, "iqn_head"):
                 raise AttributeError("IQN quantile mode requires critic_module.iqn_head for IQN.")
+        self.use_action_response_mask = getattr(self.config, "use_action_response_mask", False)
         self.c51_v_min = getattr(self.config, "c51_v_min", -10.0)
         self.c51_v_max = getattr(self.config, "c51_v_max", 10.0)
         print(f"Critic use_remove_padding={self.use_remove_padding}, distributional={self.is_distributional}")
@@ -249,7 +250,11 @@ class DataParallelPPOCritic(BasePPOCritic):
         responses = data.batch["responses"]
         attention_mask = data.batch["attention_mask"]
         response_length = responses.size(1)
-        response_mask = attention_mask[:, -response_length - 1 : -1]
+        response_mask = (
+            attention_mask[:, -response_length:]
+            if self.use_action_response_mask
+            else attention_mask[:, -response_length - 1 : -1]
+        )
 
         # Distributional critic: always return risk-neutral expectation E[Z]
         # Non-distributional critic: pass through scalar values.
@@ -359,7 +364,11 @@ class DataParallelPPOCritic(BasePPOCritic):
                     returns = data["returns"]
                     response_length = responses.size(1)
 
-                    response_mask = attention_mask[:, -response_length - 1 : -1]
+                    response_mask = (
+                        attention_mask[:, -response_length:]
+                        if self.use_action_response_mask
+                        else attention_mask[:, -response_length - 1 : -1]
+                    )
 
                     vpreds = self._forward_micro_batch(data)
 
@@ -376,8 +385,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                         if self.quantile_mode == "c51":
                             vpreds, _ = vpreds  # vpreds is logits, taus is None
                             # Generate atoms for projection
+                            n_atoms = vpreds.size(-1)
                             atoms = torch.linspace(
-                                self.c51_v_min, self.c51_v_max, self.num_quantiles,
+                                self.c51_v_min, self.c51_v_max, n_atoms,
                                 device=vpreds.device, dtype=vpreds.dtype
                             )
                             append_to_dict(

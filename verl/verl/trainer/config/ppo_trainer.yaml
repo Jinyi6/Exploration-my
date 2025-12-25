@@ -140,6 +140,7 @@ critic:
   num_quantiles: 32
   quantile_mode: iqn  # iqn | fixed
   quantile_huber_kappa: 1.0
+  use_action_response_mask: False
   risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1"
   risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"
   optim:
@@ -225,7 +226,7 @@ algorithm:
   risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_α" | "cvar_upper_α"
   # baseline / advantage shaping options for risk-sensitive PPO
   # only used when risk_apply_to is "target1" or "baseline1"
-  baseline_mode: "none"    # "none" | "neutral" | "risk" | "mix" | "reweight"
+  baseline_mode: "no_baseline"    # "no_baseline" | "neutral" | "risk" | "mix" | "reweight"
   baseline_mix_beta: 0.5   # mixing coefficient when baseline_mode == "mix"
 
 trainer:

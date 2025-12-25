@@ -152,6 +152,7 @@ python3 -m verl.trainer.main_ppo \
     ++critic.risk_apply_to=target \
     ++algorithm.risk_apply_to=target \
     ++critic.risk_level=seeking \
+    ++algorithm.risk_level=seeking \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='Polaris-Reproduce-1.7B-v2' \
@@ -172,6 +173,7 @@ python3 -m verl.trainer.main_ppo \
     ++critic.num_quantiles=${CRITIC_NUM_QUANTILES} \
     ++critic.quantile_huber_kappa=${CRITIC_QUANTILE_KAPPA} \
     ++critic.quantile_mode=${CRITIC_QUANTILE_MODE} \
+    ++critic.use_action_response_mask=True \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=15 "${@:1}"
 
