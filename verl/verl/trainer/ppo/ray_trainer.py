@@ -358,7 +358,12 @@ def compute_advantage(
         # C51 路径
         logits = data.batch["value_logits"]  # (B, T, K)
         atoms = data.batch["value_atoms"]    # (K,)
+
+        if atoms.dim() > 1:  # from (B, K) -> (K,)
+            atoms = atoms[0]
+
         has_distributional_info = True
+        #计算风险值（C51）
         rho = compute_rho_from_dist(
             dist_type="c51",
             vpreds_or_logits=logits,
@@ -374,6 +379,7 @@ def compute_advantage(
             K = quantiles.size(-1)
             device = quantiles.device
             dtype = quantiles.dtype
+            #将每个网格的中点作为分位数
             taus = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
             taus = taus.view(1, 1, -1)
         has_distributional_info = True
@@ -387,6 +393,7 @@ def compute_advantage(
     rho = rho * response_mask  # 仅作用在 response 区间
 
     # baseline 组合：neutral / risk / mix
+    #只修改传给GAE的baseline是什么
     def _build_baseline(target_like: torch.Tensor) -> torch.Tensor:
         if baseline_mode == "no_baseline":
             return torch.zeros_like(target_like)
@@ -405,7 +412,7 @@ def compute_advantage(
 
     # baseline1: 只修改 advantage 的 baseline / 权重，不影响 GAE TD 递推（returns 保持不变）
     if risk_apply_to == "baseline1":
-        G = returns  # (B, T), risk-neutral GAE target
+        G = returns  # (B, T), risk-neutral GAE target G依然是分位值的均值，不做改变
 
         # baseline_mode == "reweight": Tail Reweighting A_t = w_t * (G_t - V(s_t))
         if baseline_mode == "reweight":
@@ -417,23 +424,24 @@ def compute_advantage(
 
             # 仅在有分布信息且 risk_level 非 neutral 时才进行 tail reweighting
             try:
-                kind, alpha = parse_risk_level(risk_level)
+                kind, alpha = parse_risk_level(risk_level)#cvar_upper_0.25-->upper 0.25
             except ValueError:
-                kind, alpha = "mean", None
+                kind, alpha = "mean", None#退回neutral
 
             has_quantiles = "value_quantiles" in data.batch
             has_c51 = ("value_logits" in data.batch) and ("value_atoms" in data.batch)
-
+            #使用值分布PPO
             if kind != "mean" and alpha is not None and (has_quantiles or has_c51):
                 target_tail = "upper" if kind == "cvar_upper" else "lower"
 
                 # --- 估计 tail 分位点 q_{tail}(s_t) ---
+                #找到分位值的阈值，计算上尾/下尾分布均值
                 if has_quantiles:
                     quantiles = data.batch["value_quantiles"]  # (B, T, K)
                     K = quantiles.size(-1)
                     device = quantiles.device
                     dtype = quantiles.dtype
-
+                    #如果有分位数，则直接用，如果没有则构造一个。c51和qrdqn应该都需要先构造一个
                     if "value_taus" in data.batch:
                         taus = data.batch["value_taus"]
                         if taus.dim() == 1:
@@ -444,23 +452,28 @@ def compute_advantage(
 
                     target_tau = 1.0 - alpha if target_tail == "upper" else alpha
                     diff = torch.abs(taus - target_tau)
-                    k_star = diff.argmin(dim=-1)  # (B, T)
+                    k_star = diff.argmin(dim=-1)  # (B, T)#find index of tau
                     q_tail = quantiles.gather(-1, k_star.unsqueeze(-1)).squeeze(-1)  # (B, T)
                 else:
                     # C51：用 CDF 近似分位点
                     logits = data.batch["value_logits"]  # (B, T, K)
                     atoms = data.batch["value_atoms"]    # (K,)
+                    #fixed:处理atoms维度，只取出一维用作所有样本的atoms
+                    if atoms.dim() > 1:  # from (B, K) -> (K,)
+                        atoms = atoms[0]
+
                     probs = torch.softmax(logits, dim=-1)
                     cdf = probs.cumsum(dim=-1)
                     target_p = 1.0 - alpha if target_tail == "upper" else alpha
                     mask_cdf = cdf >= target_p
                     idx = mask_cdf.long().argmax(dim=-1)  # (B, T)
-                    atoms_expand = atoms.view(1, 1, -1)
+                    #处理维度以便gatter处理
+                    atoms_expand = atoms.view(1, 1, -1).expand(logits.size(0), logits.size(1), -1)  # (B, T, K)
                     q_tail = atoms_expand.gather(-1, idx.unsqueeze(-1)).squeeze(-1)  # (B, T)
 
                 # --- 构造软权重 w_t，支持平滑、归一化与裁剪 ---
                 reweight_cfg = data.meta_info.get("tail_reweight_cfg", {})
-                soft_beta = float(reweight_cfg.get("soft_beta", 0.5))
+                soft_beta = float(reweight_cfg.get("soft_beta", 0.5))#sigmoid温度参数
                 clip_min = float(reweight_cfg.get("clip_min", 0.1))
                 clip_max = float(reweight_cfg.get("clip_max", 10.0))
 
@@ -513,6 +526,7 @@ def compute_advantage(
                 "Please enable critic.distributional or switch risk_apply_to away from target1."
             )
         # 复用 legacy target 的“末 token 取值”作为 G_risk
+        #将最后一个位置的风险值广播到整个序列，因为最后一步包含了完整的风险信息
         last_indices = response_mask.sum(1).long() - 1
         last_indices = last_indices.clamp(min=0)
         rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1)  # (B,)
@@ -1009,6 +1023,11 @@ class RayPPOTrainer:
             rewards = reward_extra_infos_dict.get("reward", [])
             if len(rewards) == 0:
                 return metric_dict
+            #num_samples = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, "n", 128)
+            #num_problems = len(rewards) // num_samples
+            #if num_samples <= 0 or num_problems == 0:
+            #    raise ValueError(f"Invalid validation samples: num_samples={num_samples}, num_problems={num_problems}")
+            #rewards = np.array(rewards[: num_problems * num_samples]).reshape(num_problems, num_samples)
             num_samples = 128
             num_problems = len(rewards)//num_samples
             rewards = np.array(rewards).reshape(num_problems, num_samples)
@@ -1033,6 +1052,11 @@ class RayPPOTrainer:
                 save_dir=self.config.trainer.get("validation_data_dir", "./eval_passk"),
                 step=self.global_steps
             )
+
+            # avg@32: per-sample accuracy over the first k roll-outs per problem (AIME style)
+            avg_k = min(32, num_samples)
+            avg_at_k = float((rewards[:, :avg_k] > 0).mean())
+            metric_dict[f"val/avg@{avg_k}"] = avg_at_k
 
             # 写入 global pass@k
             global_results = passk_info["global"]

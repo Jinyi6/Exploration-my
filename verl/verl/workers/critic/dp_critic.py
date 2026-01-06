@@ -61,8 +61,8 @@ class DataParallelPPOCritic(BasePPOCritic):
             if self.quantile_mode not in ["fixed", "c51"] and not hasattr(self.critic_module, "iqn_head"):
                 raise AttributeError("IQN quantile mode requires critic_module.iqn_head for IQN.")
         self.use_action_response_mask = getattr(self.config, "use_action_response_mask", False)
-        self.c51_v_min = getattr(self.config, "c51_v_min", -10.0)
-        self.c51_v_max = getattr(self.config, "c51_v_max", 10.0)
+        self.c51_v_min = getattr(self.config, "c51_v_min", 0.0)
+        self.c51_v_max = getattr(self.config, "c51_v_max", 1.0)
         print(f"Critic use_remove_padding={self.use_remove_padding}, distributional={self.is_distributional}")
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
@@ -162,10 +162,33 @@ class DataParallelPPOCritic(BasePPOCritic):
                 raise RuntimeError("Distributional critic did not produce hidden_states.")
             bsz, seq_len, _ = hidden_states.shape
             if self.quantile_mode == "fixed" and hasattr(self.critic_module, "qr_head"):
-                quantiles = self.critic_module.qr_head(hidden_states)
+                if isinstance(self.critic_module, FSDP):
+                    with FSDP.summon_full_params(self.critic_module, recurse=True):
+                        quantiles = self.critic_module.qr_head(hidden_states)  # 不需要 flatten
+                else:
+                    quantiles = self.critic_module.qr_head(hidden_states)
+                #quantiles = self.critic_module.qr_head(hidden_states)
                 return quantiles, None
             if self.quantile_mode == "c51" and hasattr(self.critic_module, "c51_head"):
-                c51_logits = self.critic_module.c51_head(hidden_states)
+                #head = self.critic_module.c51_head.value_head
+                #w = head.weight
+                #print("weight type:", type(w), "is_meta:", getattr(w, "is_meta", False), "numel:", w.numel(), "shape:", tuple(w.shape))
+                #import pdb
+                #pdb.set_trace()
+                # 假设 hidden_states 的形状是 (26, 1024, 1536)
+                batch_size, seq_len, hidden_size = hidden_states.shape
+                # 调整形状为 (batch_size * seq_len, hidden_size)
+                hidden_states_flat = hidden_states.reshape(-1, hidden_size)
+
+                #c51_logits = self.critic_module.c51_head(hidden_states_flat)
+                if isinstance(self.critic_module, FSDP):
+                    with FSDP.summon_full_params(self.critic_module, recurse=True):
+                        c51_logits = self.critic_module.c51_head(hidden_states)  # 不需要 flatten
+                else:
+                    c51_logits = self.critic_module.c51_head(hidden_states)
+                # 如果需要将 logits 重新调整为 (batch_size, seq_len, num_atoms)
+                #num_atoms = c51_logits.size(-1)
+                #c51_logits = c51_logits.reshape(batch_size, seq_len, num_atoms)
                 return c51_logits, None
             taus = sample_quantile_fractions(
                 batch=bsz,
@@ -175,7 +198,12 @@ class DataParallelPPOCritic(BasePPOCritic):
                 dtype=hidden_states.dtype,
                 mode=self.quantile_mode,
             )
-            quantiles = self.critic_module.iqn_head(hidden_states, taus)
+            if isinstance(self.critic_module, FSDP):
+                with FSDP.summon_full_params(self.critic_module, recurse=True):
+                    quantiles = self.critic_module.iqn_head(hidden_states, taus)  # 不需要 flatten
+            else:
+                quantiles = self.critic_module.iqn_head(hidden_states, taus)
+            #quantiles = self.critic_module.iqn_head(hidden_states, taus)
             return quantiles, taus
 
     def _optimizer_step(self):
@@ -304,7 +332,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                     device=values.device,
                     dtype=values.dtype,
                 )
-                tensors["value_atoms"] = atoms
+                #tensors["value_atoms"] = atoms
+                atoms_batched = atoms.unsqueeze(0).expand(values.size(0), -1)  # (B, K) 匹配 batch 维
+                tensors["value_atoms"] = atoms_batched
             else:
                 tensors["value_quantiles"] = values  # (B, T, K) masked on response
                 if taus is not None:

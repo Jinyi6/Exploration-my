@@ -1073,9 +1073,11 @@ class CriticWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             values = self.critic.compute_values(data=data)
             # critic may return either a tensor (legacy) or a DataProto (with extra fields)
-            if isinstance(values, DataProto):
+            if isinstance(values, DataProto) or hasattr(values, "batch"):
                 output = values
             else:
+                if not torch.is_tensor(values):
+                    raise TypeError(f"Expected DataProto or torch.Tensor for critic outputs, got {type(values)}")
                 output = DataProto.from_dict(tensors={"values": values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
