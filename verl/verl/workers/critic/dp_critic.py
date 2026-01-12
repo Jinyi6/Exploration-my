@@ -50,6 +50,8 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_optimizer = critic_optimizer
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
         self.is_distributional = getattr(self.config, "distributional", False)
+        self.is_distributional_v2 = getattr(self.config, "distributional_v2", False)
+        self.is_distributional_v3 = getattr(self.config, "distributional_v3", False)
         self.num_quantiles = getattr(self.config, "num_quantiles", 1)
         self.quantile_huber_kappa = getattr(self.config, "quantile_huber_kappa", 1.0)
         self.quantile_mode = getattr(self.config, "quantile_mode", "iqn")
@@ -63,10 +65,97 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.use_action_response_mask = getattr(self.config, "use_action_response_mask", False)
         self.c51_v_min = getattr(self.config, "c51_v_min", 0.0)
         self.c51_v_max = getattr(self.config, "c51_v_max", 1.0)
-        print(f"Critic use_remove_padding={self.use_remove_padding}, distributional={self.is_distributional}")
+        self.sr_lambda = getattr(self.config, "sr_lambda", 0.9)
+        self.sr_num_samples = getattr(self.config, "sr_num_samples", 8)
+        print(
+            f"Critic use_remove_padding={self.use_remove_padding}, "
+            f"distributional={self.is_distributional}, distributional_v2={self.is_distributional_v2}, "
+            f"distributional_v3={self.is_distributional_v3}"
+        )
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+
+    def _build_sr_targets_quantiles(self, old_q, rewards, response_mask):
+        if not (0.0 <= self.sr_lambda <= 1.0):
+            raise ValueError(f"sr_lambda must be in [0, 1], got {self.sr_lambda}")
+        bs, t, k_old = old_q.shape
+        m = self.sr_num_samples
+        old_q_next = torch.zeros_like(old_q)
+        old_q_next[:, :-1, :] = old_q[:, 1:, :]
+        next_mask = torch.zeros_like(response_mask)
+        next_mask[:, :-1] = response_mask[:, 1:]
+
+        z = torch.zeros(bs, m, device=old_q.device, dtype=old_q.dtype)
+        targets = torch.zeros(bs, t, m, device=old_q.device, dtype=old_q.dtype)
+        for idx in range(t - 1, -1, -1):
+            valid = response_mask[:, idx].to(torch.bool)
+            if not valid.any():
+                continue
+            sample_idx = torch.randint(0, k_old, (bs, m), device=old_q.device)
+            fresh = old_q_next[:, idx, :].gather(1, sample_idx)
+            replace = torch.rand(bs, m, device=old_q.device) < (1.0 - self.sr_lambda)
+            z_new = torch.where(replace, fresh, z)
+            z_new = rewards[:, idx].unsqueeze(-1) + self.config.gamma * next_mask[:, idx].unsqueeze(-1) * z_new
+            z = torch.where(valid.unsqueeze(-1), z_new, z)
+            targets[:, idx, :] = torch.where(valid.unsqueeze(-1), z_new, targets[:, idx, :])
+        return targets
+
+    def _project_c51_samples(self, z_samples, atoms):
+        bs, t, m = z_samples.shape
+        n_atoms = atoms.numel()
+        v_min = atoms[0]
+        v_max = atoms[-1]
+        delta_z = atoms[1] - atoms[0]
+
+        values = z_samples.clamp(min=v_min.item(), max=v_max.item())
+        b = (values - v_min) / delta_z
+        l = b.floor().long()
+        u = (l + 1).clamp(min=0, max=n_atoms - 1)
+        l = l.clamp(min=0, max=n_atoms - 1)
+        offset = (b - l.to(b.dtype)).clamp(min=0.0, max=1.0)
+
+        target_probs = torch.zeros(bs, t, n_atoms, device=z_samples.device, dtype=z_samples.dtype)
+        target_probs_flat = target_probs.view(-1, n_atoms)
+        l_flat = l.view(-1, m)
+        u_flat = u.view(-1, m)
+        weight_l = (1.0 - offset).view(-1, m) / m
+        weight_u = offset.view(-1, m) / m
+
+        target_probs_flat.scatter_add_(1, l_flat, weight_l.to(target_probs_flat.dtype))
+        target_probs_flat.scatter_add_(1, u_flat, weight_u.to(target_probs_flat.dtype))
+        return target_probs
+
+    def _build_sr_targets_c51(self, old_logits, rewards, response_mask, atoms):
+        if not (0.0 <= self.sr_lambda <= 1.0):
+            raise ValueError(f"sr_lambda must be in [0, 1], got {self.sr_lambda}")
+        bs, t, n_atoms = old_logits.shape
+        m = self.sr_num_samples
+        next_logits = torch.zeros_like(old_logits)
+        next_logits[:, :-1, :] = old_logits[:, 1:, :]
+        next_mask = torch.zeros_like(response_mask)
+        next_mask[:, :-1] = response_mask[:, 1:]
+        next_logits = next_logits.masked_fill(~next_mask.bool().unsqueeze(-1), 0.0)
+        next_probs = torch.softmax(next_logits.float(), dim=-1).detach()
+
+        z = torch.zeros(bs, m, device=old_logits.device, dtype=old_logits.dtype)
+        z_samples = torch.zeros(bs, t, m, device=old_logits.device, dtype=old_logits.dtype)
+        for idx in range(t - 1, -1, -1):
+            valid = response_mask[:, idx].to(torch.bool)
+            if not valid.any():
+                continue
+            has_next = next_mask[:, idx].to(torch.bool)
+            atom_idx = torch.multinomial(next_probs[:, idx, :], m, replacement=True)
+            fresh = atoms[atom_idx]
+            fresh = torch.where(has_next.unsqueeze(-1), fresh, torch.zeros_like(fresh))
+            replace = torch.rand(bs, m, device=old_logits.device) < (1.0 - self.sr_lambda)
+            z_new = torch.where(replace, fresh, z)
+            z_new = rewards[:, idx].unsqueeze(-1) + self.config.gamma * next_mask[:, idx].unsqueeze(-1) * z_new
+            z = torch.where(valid.unsqueeze(-1), z_new, z)
+            z_samples[:, idx, :] = torch.where(valid.unsqueeze(-1), z_new, z_samples[:, idx, :])
+
+        target_probs = self._project_c51_samples(z_samples, atoms)
+        return target_probs
 
     def _forward_micro_batch(self, micro_batch):
         response_length = micro_batch["responses"].size(-1)
@@ -283,12 +372,15 @@ class DataParallelPPOCritic(BasePPOCritic):
             if self.use_action_response_mask
             else attention_mask[:, -response_length - 1 : -1]
         )
+        if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
+            response_mask = attention_mask[:, -response_length:]
 
         # Distributional critic: always return risk-neutral expectation E[Z]
         # Non-distributional critic: pass through scalar values.
         if self.is_distributional:
             if self.quantile_mode == "c51":
                 # values are logits over atoms
+                values = values * response_mask.unsqueeze(-1)
                 probs = torch.softmax(values, dim=-1)
                 atoms = torch.linspace(
                     self.c51_v_min,
@@ -349,6 +441,12 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = {}
 
         select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
+            select_keys.append("token_level_rewards")
+            if self.quantile_mode == "c51":
+                select_keys.append("value_logits")
+            else:
+                select_keys.append("value_quantiles")
         if self.is_distributional and self.quantile_mode == "iqn":
             # pull optional target quantiles/taus if available
             for key in ["target_quantiles", "target_taus"]:
@@ -399,6 +497,8 @@ class DataParallelPPOCritic(BasePPOCritic):
                         if self.use_action_response_mask
                         else attention_mask[:, -response_length - 1 : -1]
                     )
+                    if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
+                        response_mask = attention_mask[:, -response_length:]
 
                     vpreds = self._forward_micro_batch(data)
 
@@ -428,12 +528,48 @@ class DataParallelPPOCritic(BasePPOCritic):
                                     "critic/atoms_std": atoms.std(unbiased=False).item(),
                                 },
                             )
-                            vf_loss = core_algos.compute_categorical_value_loss(
-                                logits=vpreds,
-                                returns=returns,
-                                response_mask=response_mask,
-                                atoms=atoms,
-                            )
+                            if self.is_distributional_v3:
+                                token_level_rewards = data["token_level_rewards"]
+                                assert token_level_rewards.shape[:2] == response_mask.shape, (
+                                    "token_level_rewards and response_mask must align in (B, T)."
+                                )
+                                old_logits = data["value_logits"].detach()
+                                with torch.no_grad():
+                                    target_probs = self._build_sr_targets_c51(
+                                        old_logits=old_logits,
+                                        rewards=token_level_rewards,
+                                        response_mask=response_mask,
+                                        atoms=atoms,
+                                    )
+                                log_probs = torch.log_softmax(vpreds, dim=-1)
+                                loss_per_token = -torch.sum(target_probs * log_probs, dim=-1)
+                                vf_loss = masked_mean(loss_per_token, response_mask)
+                            elif self.is_distributional_v2:
+                                token_level_rewards = data["token_level_rewards"]
+                                assert token_level_rewards.shape[:2] == response_mask.shape, (
+                                    "token_level_rewards and response_mask must align in (B, T)."
+                                )
+                                old_logits = data["value_logits"].detach()
+                                next_logits = torch.zeros_like(old_logits)
+                                next_logits[:, :-1, :] = old_logits[:, 1:, :]
+                                next_mask = torch.zeros_like(response_mask)
+                                next_mask[:, :-1] = response_mask[:, 1:]
+                                vf_loss = core_algos.compute_categorical_value_loss_v2(
+                                    logits=vpreds,
+                                    next_logits=next_logits,
+                                    rewards=token_level_rewards,
+                                    response_mask=response_mask,
+                                    atoms=atoms,
+                                    gamma=self.config.gamma,
+                                    next_mask=next_mask,
+                                )
+                            else:
+                                vf_loss = core_algos.compute_categorical_value_loss(
+                                    logits=vpreds,
+                                    returns=returns,
+                                    response_mask=response_mask,
+                                    atoms=atoms,
+                                )
                             # For logging/metrics, compute expected value
                             probs = torch.softmax(vpreds, dim=-1)
                             expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
@@ -454,15 +590,64 @@ class DataParallelPPOCritic(BasePPOCritic):
                                         "critic/quantile_std": flat_quantiles.std(unbiased=False).item(),
                                     },
                                 )
-                            vf_loss = core_algos.compute_quantile_value_loss(
-                                vpreds=vpreds,  # (bs, T, K)
-                                returns=returns,  # scalar targets
-                                response_mask=response_mask,
-                                num_quantiles=self.num_quantiles,
-                                tau_mode=self.quantile_mode,  # iqn or fixed
-                                kappa=self.quantile_huber_kappa,
-                                taus=taus,
-                            )
+                            if self.is_distributional_v3:
+                                token_level_rewards = data["token_level_rewards"]
+                                assert token_level_rewards.shape[:2] == response_mask.shape, (
+                                    "token_level_rewards and response_mask must align in (B, T)."
+                                )
+                                old_q = data["value_quantiles"].detach()
+                                with torch.no_grad():
+                                    target_q = self._build_sr_targets_quantiles(
+                                        old_q=old_q,
+                                        rewards=token_level_rewards,
+                                        response_mask=response_mask,
+                                    )
+                                if taus is None:
+                                    k = vpreds.size(-1)
+                                    taus = (torch.arange(k, device=vpreds.device, dtype=vpreds.dtype) + 0.5) / k
+                                    taus = taus.view(1, 1, k).expand_as(vpreds)
+                                vf_loss = core_algos.compute_IQN_quantile_value_loss(
+                                    vpreds=vpreds,  # (bs, T, K)
+                                    target_quantiles=target_q,
+                                    response_mask=response_mask,
+                                    kappa=self.quantile_huber_kappa,
+                                    taus=taus,
+                                )
+                            elif self.is_distributional_v2:
+                                token_level_rewards = data["token_level_rewards"]
+                                assert token_level_rewards.shape[:2] == response_mask.shape, (
+                                    "token_level_rewards and response_mask must align in (B, T)."
+                                )
+                                old_q = data["value_quantiles"].detach()
+                                next_q = torch.zeros_like(old_q)
+                                next_q[:, :-1, :] = old_q[:, 1:, :]
+                                next_mask = torch.zeros_like(response_mask)
+                                next_mask[:, :-1] = response_mask[:, 1:]
+                                with torch.no_grad():
+                                    target_q = token_level_rewards.unsqueeze(-1) + (
+                                        self.config.gamma * next_mask.unsqueeze(-1) * next_q
+                                    )
+                                if taus is None:
+                                    k = vpreds.size(-1)
+                                    taus = (torch.arange(k, device=vpreds.device, dtype=vpreds.dtype) + 0.5) / k
+                                    taus = taus.view(1, 1, k).expand_as(vpreds)
+                                vf_loss = core_algos.compute_IQN_quantile_value_loss(
+                                    vpreds=vpreds,  # (bs, T, K)
+                                    target_quantiles=target_q,
+                                    response_mask=response_mask,
+                                    kappa=self.quantile_huber_kappa,
+                                    taus=taus,
+                                )
+                            else:
+                                vf_loss = core_algos.compute_quantile_value_loss(
+                                    vpreds=vpreds,  # (bs, T, K)
+                                    returns=returns,  # scalar targets
+                                    response_mask=response_mask,
+                                    num_quantiles=self.num_quantiles,
+                                    tau_mode=self.quantile_mode,  # iqn or fixed
+                                    kappa=self.quantile_huber_kappa,
+                                    taus=taus,
+                                )
                             vf_clipfrac = torch.tensor(0.0, device=vpreds.device)  # not used for dist. loss
                             vpred_mean = masked_mean(vpreds.mean(dim=-1), response_mask).detach().item()  # mean of quantiles
                     else:

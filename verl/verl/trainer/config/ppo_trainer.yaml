@@ -137,9 +137,14 @@ critic:
   rollout_n: ${actor_rollout_ref.rollout.n}
   strategy: fsdp # [fsdp, fsdp2]
   distributional: false
+  distributional_v2: false
+  distributional_v3: false
   num_quantiles: 32
   quantile_mode: iqn  # iqn | fixed
   quantile_huber_kappa: 1.0
+  gamma: ${algorithm.gamma}
+  sr_lambda: 0.9
+  sr_num_samples: 8
   use_action_response_mask: False
   risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1"
   risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"

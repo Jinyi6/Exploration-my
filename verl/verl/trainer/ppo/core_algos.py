@@ -599,7 +599,7 @@ def compute_IQN_quantile_value_loss(
     huber = torch.where(abs_diff <= kappa, 0.5 * diff.pow(2), kappa * (abs_diff - 0.5 * kappa))
 
     tau = taus.unsqueeze(-1)  # (bs, T, K, 1)
-    quantile_loss = torch.abs(tau - (diff < 0).float()) * huber
+    quantile_loss = torch.abs(tau - (diff < 0).to(tau.dtype)) * huber
     # mean over target quantiles K'
     quantile_loss = quantile_loss.mean(dim=-1)  # (bs, T, K)
 
@@ -636,7 +636,7 @@ def compute_quantile_value_loss(
     abs_diff = diff.abs()
     huber = torch.where(abs_diff <= kappa, 0.5 * diff.pow(2), kappa * (abs_diff - 0.5 * kappa))
     tau = taus.unsqueeze(-1)
-    loss = (torch.abs(tau - (diff < 0).float()) * huber).mean(dim=-2)  # mean over target dim
+    loss = (torch.abs(tau - (diff < 0).to(tau.dtype)) * huber).mean(dim=-2)  # mean over target dim
     loss_mask = response_mask.unsqueeze(-1)  # (bs, T, 1)
     loss = verl_F.masked_mean(loss, loss_mask)
     return loss
@@ -712,6 +712,65 @@ def compute_categorical_value_loss(
     # 4. Mask and Average
     loss = verl_F.masked_mean(loss_per_token, response_mask)
 
+    return loss
+
+
+def compute_categorical_value_loss_v2(
+    logits: torch.FloatTensor,
+    next_logits: torch.FloatTensor,
+    rewards: torch.FloatTensor,
+    response_mask: torch.FloatTensor,
+    atoms: torch.FloatTensor,
+    gamma: float,
+    next_mask: torch.FloatTensor,
+):
+    """
+    Compute the categorical value loss for C51 with distributional Bellman backup.
+    Projects the next-state distribution onto the fixed atoms (support), then computes
+    the Cross Entropy loss between the predicted logits and the target distribution.
+    Args:
+        logits: (bs, T, num_atoms) - predicted logits (unnormalized log-probs)
+        next_logits: (bs, T, num_atoms) - next-state logits (target network, stop-grad)
+        rewards: (bs, T) - token-level rewards
+        response_mask: (bs, T) - mask for valid tokens
+        atoms: (num_atoms,) - fixed atom values (support)
+        gamma: discount factor
+        next_mask: (bs, T) - mask for valid next tokens
+    """
+    bs, t, n_atoms = logits.shape
+    assert next_logits.shape == (bs, t, n_atoms), f"next_logits shape mismatch: {next_logits.shape}"
+    assert rewards.shape == (bs, t), f"rewards shape mismatch: {rewards.shape}"
+    assert atoms.shape == (n_atoms,), f"atoms shape mismatch: expected ({n_atoms},), got {atoms.shape}"
+    assert next_mask.shape == (bs, t), f"next_mask shape mismatch: {next_mask.shape}"
+
+    v_min = atoms[0]
+    v_max = atoms[-1]
+    delta_z = atoms[1] - atoms[0]
+
+    next_probs = torch.softmax(next_logits, dim=-1).detach()
+    tz = rewards.unsqueeze(-1) + gamma * next_mask.unsqueeze(-1) * atoms.view(1, 1, -1)
+    tz = tz.clamp(min=v_min.item(), max=v_max.item())
+
+    b = (tz - v_min) / delta_z
+    l = b.floor().long()
+    u = (l + 1).clamp(min=0, max=n_atoms - 1)
+    l = l.clamp(min=0, max=n_atoms - 1)
+    offset = (b - l.to(b.dtype)).clamp(min=0.0, max=1.0)
+
+    target_probs = torch.zeros_like(next_probs)
+    target_probs_flat = target_probs.view(-1, n_atoms)
+    l_flat = l.view(-1, n_atoms)
+    u_flat = u.view(-1, n_atoms)
+    offset_flat = offset.view(-1, n_atoms)
+    next_probs_flat = next_probs.view(-1, n_atoms)
+
+    target_probs_flat.scatter_add_(1, l_flat, next_probs_flat * (1.0 - offset_flat))
+    target_probs_flat.scatter_add_(1, u_flat, next_probs_flat * offset_flat)
+    target_probs = target_probs_flat.view(bs, t, n_atoms)
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+    loss_per_token = -torch.sum(target_probs * log_probs, dim=-1)
+    loss = verl_F.masked_mean(loss_per_token, response_mask)
     return loss
 
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
