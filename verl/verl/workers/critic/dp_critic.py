@@ -381,16 +381,16 @@ class DataParallelPPOCritic(BasePPOCritic):
             if self.quantile_mode == "c51":
                 # values are logits over atoms
                 values = values * response_mask.unsqueeze(-1)
-                probs = torch.softmax(values, dim=-1)
+                probs = torch.softmax(values.float(), dim=-1)
                 atoms = torch.linspace(
                     self.c51_v_min,
                     self.c51_v_max,
                     values.size(-1),
                     device=values.device,
-                    dtype=values.dtype,
+                    dtype=torch.float32,
                 )
                 expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
-                values_mean = expect * response_mask
+                values_mean = expect.to(values.dtype) * response_mask
             else:
                 # IQN / fixed quantile: values are quantiles (B, T, K)
                 values = values * response_mask.unsqueeze(-1)
@@ -571,7 +571,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                                     atoms=atoms,
                                 )
                             # For logging/metrics, compute expected value
-                            probs = torch.softmax(vpreds, dim=-1)
+                            probs = torch.softmax(vpreds.float(), dim=-1)
                             expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
                             vpred_mean = masked_mean(expect, response_mask).detach().item()
                             vf_clipfrac = torch.tensor(0.0, device=vpreds.device)

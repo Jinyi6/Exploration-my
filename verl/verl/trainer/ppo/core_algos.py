@@ -747,7 +747,7 @@ def compute_categorical_value_loss_v2(
     v_max = atoms[-1]
     delta_z = atoms[1] - atoms[0]
 
-    next_probs = torch.softmax(next_logits, dim=-1).detach()
+    next_probs = torch.softmax(next_logits.float(), dim=-1).detach()
     tz = rewards.unsqueeze(-1) + gamma * next_mask.unsqueeze(-1) * atoms.view(1, 1, -1)
     tz = tz.clamp(min=v_min.item(), max=v_max.item())
 
@@ -768,7 +768,7 @@ def compute_categorical_value_loss_v2(
     target_probs_flat.scatter_add_(1, u_flat, next_probs_flat * offset_flat)
     target_probs = target_probs_flat.view(bs, t, n_atoms)
 
-    log_probs = torch.log_softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits.float(), dim=-1)
     loss_per_token = -torch.sum(target_probs * log_probs, dim=-1)
     loss = verl_F.masked_mean(loss_per_token, response_mask)
     return loss

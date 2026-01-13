@@ -1071,14 +1071,11 @@ class RayPPOTrainer:
             rewards = reward_extra_infos_dict.get("reward", [])
             if len(rewards) == 0:
                 return metric_dict
-            #num_samples = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, "n", 128)
-            #num_problems = len(rewards) // num_samples
-            #if num_samples <= 0 or num_problems == 0:
-            #    raise ValueError(f"Invalid validation samples: num_samples={num_samples}, num_problems={num_problems}")
-            #rewards = np.array(rewards[: num_problems * num_samples]).reshape(num_problems, num_samples)
-            num_samples = 128
-            num_problems = len(rewards)//num_samples
-            rewards = np.array(rewards).reshape(num_problems, num_samples)
+            num_samples = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, "n", 128)
+            num_problems = len(rewards) // num_samples if num_samples > 0 else 0
+            if num_samples <= 0 or num_problems == 0:
+                raise ValueError(f"Invalid validation samples: num_samples={num_samples}, num_problems={num_problems}")
+            rewards = np.array(rewards[: num_problems * num_samples]).reshape(num_problems, num_samples)
 
             samples = []
             for i in range(num_problems):
@@ -1090,7 +1087,7 @@ class RayPPOTrainer:
                     "ability": "math"
                 })
 
-            k_values = [1, 2, 4, 8, 16, 32, 64, 128]
+            k_values = [k for k in [1, 2, 4, 8, 16, 32, 64, 128] if k <= num_samples]
 
             from verl.trainer.ppo.metric_utils_passk import evaluate_passk_distribution
 
