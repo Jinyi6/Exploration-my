@@ -422,7 +422,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     self.c51_v_max,
                     values.size(-1),
                     device=values.device,
-                    dtype=values.dtype,
+                    dtype=torch.float32,
                 )
                 #tensors["value_atoms"] = atoms
                 atoms_batched = atoms.unsqueeze(0).expand(values.size(0), -1)  # (B, K) 匹配 batch 维
@@ -518,7 +518,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                             n_atoms = vpreds.size(-1)
                             atoms = torch.linspace(
                                 self.c51_v_min, self.c51_v_max, n_atoms,
-                                device=vpreds.device, dtype=vpreds.dtype
+                                device=vpreds.device, dtype=torch.float32
                             )
                             append_to_dict(
                                 metrics,{
@@ -663,7 +663,8 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = vf_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        micro_bsz = data["attention_mask"].shape[0]
+                        loss = vf_loss * (micro_bsz / self.config.ppo_mini_batch_size)
                     else:
                         loss = vf_loss / self.gradient_accumulation
 

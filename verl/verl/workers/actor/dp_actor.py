@@ -354,7 +354,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        micro_bsz = data["attention_mask"].shape[0]
+                        loss = policy_loss * (micro_bsz / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()

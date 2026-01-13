@@ -498,6 +498,8 @@ def compute_advantage(
                         taus = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
                         taus = taus.view(1, 1, -1)
 
+                    if taus.shape != quantiles.shape:
+                        taus = taus.expand_as(quantiles)
                     target_tau = 1.0 - alpha if target_tail == "upper" else alpha
                     diff = torch.abs(taus - target_tau)
                     k_star = diff.argmin(dim=-1)  # (B, T)#find index of tau
