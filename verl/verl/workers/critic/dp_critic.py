@@ -390,7 +390,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     dtype=torch.float32,
                 )
                 expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
-                values_mean = expect.to(values.dtype) * response_mask
+                values_mean = expect * response_mask
             else:
                 # IQN / fixed quantile: values are quantiles (B, T, K)
                 values = values * response_mask.unsqueeze(-1)
