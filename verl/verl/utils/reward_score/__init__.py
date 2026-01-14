@@ -53,6 +53,15 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
+    elif data_source in ["locomo"]:
+        from . import locomo
+
+        res = locomo.compute_score(
+            data_source=data_source,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+        )
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
