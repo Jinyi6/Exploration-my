@@ -17,6 +17,8 @@ VAL_NOISE_ALL_LAYERS=false
 VAL_NOISE_DECAY_STEPS=0.0
 VAL_NOISE_DECAY_MIN_STD=0.0
 CRITIC_DISTRIBUTIONAL=true
+CRITIC_DISTRIBUTIONAL_V2=true
+CRITIC_DISTRIBUTIONAL_V3=false
 CRITIC_NUM_QUANTILES=32
 CRITIC_QUANTILE_KAPPA=1.0
 CRITIC_QUANTILE_MODE=iqn
@@ -69,6 +71,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --critic_distributional)
             CRITIC_DISTRIBUTIONAL="$2"
+            shift 2
+            ;;
+        --critic_distributional_v2)
+            CRITIC_DISTRIBUTIONAL_V2="$2"
+            shift 2
+            ;;
+        --critic_distributional_v3)
+            CRITIC_DISTRIBUTIONAL_V3="$2"
             shift 2
             ;;
         --critic_num_quantiles)
@@ -166,6 +176,8 @@ python3 -m verl.trainer.main_ppo \
     ++trainer.validation_noise.decay.steps=${VAL_NOISE_DECAY_STEPS} \
     ++trainer.validation_noise.decay.min_std=${VAL_NOISE_DECAY_MIN_STD} \
     ++critic.distributional=${CRITIC_DISTRIBUTIONAL} \
+    ++critic.distributional_v2=${CRITIC_DISTRIBUTIONAL_V2} \
+    ++critic.distributional_v3=${CRITIC_DISTRIBUTIONAL_V3} \
     ++critic.num_quantiles=${CRITIC_NUM_QUANTILES} \
     ++critic.quantile_huber_kappa=${CRITIC_QUANTILE_KAPPA} \
     ++critic.quantile_mode=${CRITIC_QUANTILE_MODE} \

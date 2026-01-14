@@ -344,7 +344,7 @@ def compute_advantage(
         return data
 
     # === Step 2b：如果没有风险需求，直接返回 ===
-    if risk_apply_to not in ["baseline1", "target1"]:
+    if risk_apply_to not in ["baseline1", "target1", "gae_rho"]:
         return data
 
     # === Step 2c：从 Critic 输出中恢复分布，计算 rho(Z)（如果可用） ===
@@ -410,6 +410,54 @@ def compute_advantage(
             return beta * b_neutral + (1.0 - beta) * b_risk
         raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
 
+    def _record_masked_stats(name_prefix: str, tensor: torch.Tensor) -> None:
+        masked = tensor * response_mask
+        valid_cnt = response_mask.sum().clamp(min=1.0).to(masked.dtype)
+        mean = masked.sum() / valid_cnt
+        var = ((masked - mean * response_mask) ** 2).sum() / valid_cnt
+        std = torch.sqrt(var + 1e-8)
+        adv_metrics = data.meta_info.setdefault("adv_metrics", {})
+        adv_metrics[f"{name_prefix}_mean"] = float(mean.detach().item())
+        adv_metrics[f"{name_prefix}_std"] = float(std.detach().item())
+        adv_metrics[f"{name_prefix}_min"] = float(masked.min().detach().item())
+        adv_metrics[f"{name_prefix}_max"] = float(masked.max().detach().item())
+
+    if risk_apply_to == "gae_rho":
+        if not has_distributional_info:
+            raise ValueError(
+                "algorithm.risk_apply_to=gae_rho requires a distributional critic output "
+                "(value_logits/value_atoms or value_quantiles). "
+                "Please enable critic.distributional or switch risk_apply_to away from gae_rho."
+            )
+
+        if baseline_mode == "neutral":
+            values_for_gae = values_neutral * response_mask
+        elif baseline_mode == "risk":
+            values_for_gae = rho * response_mask
+        elif baseline_mode == "mix":
+            beta = baseline_mix_beta
+            values_for_gae = (beta * values_neutral + (1.0 - beta) * rho) * response_mask
+        elif baseline_mode == "no_baseline":
+            values_for_gae = torch.zeros_like(values_neutral)
+        elif baseline_mode == "reweight":
+            raise ValueError(
+                "baseline_mode=reweight is not supported for risk_apply_to=gae_rho. "
+                "Use no_baseline/neutral/risk/mix instead."
+            )
+        else:
+            raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
+
+        adv_rho, _ = core_algos.compute_gae_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            values=values_for_gae,
+            response_mask=response_mask,
+            gamma=gamma,
+            lam=lam,
+        )
+        data.batch["advantages"] = adv_rho
+        _record_masked_stats("adv/actor_values_for_gae", values_for_gae)
+        return data
+
     # baseline1: 只修改 advantage 的 baseline / 权重，不影响 GAE TD 递推（returns 保持不变）
     if risk_apply_to == "baseline1":
         G = returns  # (B, T), risk-neutral GAE target G依然是分位值的均值，不做改变
@@ -450,6 +498,8 @@ def compute_advantage(
                         taus = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
                         taus = taus.view(1, 1, -1)
 
+                    if taus.shape != quantiles.shape:
+                        taus = taus.expand_as(quantiles)
                     target_tau = 1.0 - alpha if target_tail == "upper" else alpha
                     diff = torch.abs(taus - target_tau)
                     k_star = diff.argmin(dim=-1)  # (B, T)#find index of tau
@@ -507,7 +557,7 @@ def compute_advantage(
             raw_adv = w * (G - b) * response_mask
             reshaped_adv = masked_whiten(raw_adv, response_mask)
             data.batch["advantages"] = reshaped_adv
-            data.batch["adv_weights"] = w
+            _record_masked_stats("adv/weights", w)
             return data
 
         # 其它 baseline_mode 沿用 risk-neutral / risk / mix baseline
@@ -537,7 +587,7 @@ def compute_advantage(
         reshaped_adv = masked_whiten(raw_adv, response_mask)
 
         data.batch["advantages"] = reshaped_adv
-        data.batch["risk_returns"] = risk_returns  # 仅用于分析 / 可视化
+        _record_masked_stats("adv/risk_returns", risk_returns)
         return data
 
     return data
@@ -1023,14 +1073,11 @@ class RayPPOTrainer:
             rewards = reward_extra_infos_dict.get("reward", [])
             if len(rewards) == 0:
                 return metric_dict
-            #num_samples = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, "n", 128)
-            #num_problems = len(rewards) // num_samples
-            #if num_samples <= 0 or num_problems == 0:
-            #    raise ValueError(f"Invalid validation samples: num_samples={num_samples}, num_problems={num_problems}")
-            #rewards = np.array(rewards[: num_problems * num_samples]).reshape(num_problems, num_samples)
-            num_samples = 128
-            num_problems = len(rewards)//num_samples
-            rewards = np.array(rewards).reshape(num_problems, num_samples)
+            num_samples = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, "n", 128)
+            num_problems = len(rewards) // num_samples if num_samples > 0 else 0
+            if num_samples <= 0 or num_problems == 0:
+                raise ValueError(f"Invalid validation samples: num_samples={num_samples}, num_problems={num_problems}")
+            rewards = np.array(rewards[: num_problems * num_samples]).reshape(num_problems, num_samples)
 
             samples = []
             for i in range(num_problems):
@@ -1042,7 +1089,7 @@ class RayPPOTrainer:
                     "ability": "math"
                 })
 
-            k_values = [1, 2, 4, 8, 16, 32, 64, 128]
+            k_values = [k for k in [1, 2, 4, 8, 16, 32, 64, 128] if k <= num_samples]
 
             from verl.trainer.ppo.metric_utils_passk import evaluate_passk_distribution
 

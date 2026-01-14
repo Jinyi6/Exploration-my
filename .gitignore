@@ -122,6 +122,4 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 logs
 log
 outputs
-归档.zip
-归档 5.zip
-归档*
+*.zip

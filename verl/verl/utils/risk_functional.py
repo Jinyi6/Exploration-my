@@ -96,7 +96,7 @@ def cvar_from_c51(logits, atoms, mode, alpha):
         mode: "cvar_lower" or "cvar_upper"
         alpha: tail probability
     """
-    probs = torch.softmax(logits, dim=-1) # (B, T, K)
+    probs = torch.softmax(logits.float(), dim=-1) # (B, T, K)
     cdf = probs.cumsum(dim=-1) # (B, T, K)
     
     # Note: CDF is monotonic.
@@ -173,7 +173,7 @@ def compute_rho_from_dist(dist_type, vpreds_or_logits, taus_or_atoms, risk_level
             # Simple mean of quantiles
             return vpreds_or_logits.mean(dim=-1)
         else: # c51
-            probs = torch.softmax(vpreds_or_logits, dim=-1)
+            probs = torch.softmax(vpreds_or_logits.float(), dim=-1)
             # atoms assumed (K,) -> (1,1,K) broadcast
             # values shape (B,T,K)
             return (probs * taus_or_atoms.view(1,1,-1)).sum(dim=-1)
