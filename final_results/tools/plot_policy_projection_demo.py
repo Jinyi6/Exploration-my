@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def mix_gauss(x, comps):
-    """Return a normalized mixture of Gaussians over x."""
+    """返回一维高斯混合密度。"""
     y = np.zeros_like(x, dtype=float)
     for weight, mean, std in comps:
         y += weight * np.exp(-0.5 * ((x - mean) / std) ** 2) / (std * np.sqrt(2 * np.pi))
@@ -13,7 +13,7 @@ def mix_gauss(x, comps):
 
 
 def gaussian_kde_1d(x, samples, bandwidth):
-    """Simple Gaussian KDE without external deps."""
+    """无需外部依赖的简单 1D KDE。"""
     diffs = (x[:, None] - samples[None, :]) / bandwidth
     kernel = np.exp(-0.5 * diffs**2) / (bandwidth * np.sqrt(2 * np.pi))
     return kernel.mean(axis=1)
@@ -22,18 +22,18 @@ def gaussian_kde_1d(x, samples, bandwidth):
 def plot_projection_schematic():
     x = np.linspace(-4, 4, 1200)
 
-    # Gray: pre-train/base policy projection
+    # 灰色：训练前/基座策略投影
     p0 = mix_gauss(x, [(0.55, -1.8, 0.9), (0.45, 1.2, 1.1)])
 
-    # Blue: SFT-style sharpening (moderate)
+    # 蓝色：SFT 风格（适度锐化）
     psft = mix_gauss(x, [(0.45, -1.8, 1.0), (0.55, 1.5, 0.45)])
 
-    # Blue: Off-policy DPO/IPO style (sharper peak, squeezed middle)
+    # 蓝色：Off-policy DPO/IPO 风格（更尖、更挤压）
     pdpo = mix_gauss(x, [(0.85, -2.1, 0.22), (0.15, 2.4, 0.40)])
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.2))
 
-    # Panel 1: SFT
+    # 面板 1：SFT
     ax = axes[0]
     ax.plot(x, p0, lw=3, alpha=0.45, color="gray", label="pre")
     ax.plot(x, psft, lw=3, color="tab:blue", label="after")
@@ -41,7 +41,7 @@ def plot_projection_schematic():
     ax.set_yticks([])
     ax.set_xticks([])
 
-    # Mark y_u^+ with a red arrow
+    # 标记 y_u^+（红箭头）
     yu_plus = 1.5
     yu_idx = np.argmin(np.abs(x - yu_plus))
     ax.annotate(
@@ -52,7 +52,7 @@ def plot_projection_schematic():
     )
     ax.text(yu_plus + 0.05, 0.02, r"$y_u^+$")
 
-    # Panel 2: Off-policy DPO/IPO
+    # 面板 2：Off-policy DPO/IPO
     ax = axes[1]
     ax.plot(x, p0, lw=3, alpha=0.45, color="gray", label="pre")
     ax.plot(x, pdpo, lw=3, color="tab:blue", label="after")
@@ -60,12 +60,12 @@ def plot_projection_schematic():
     ax.set_yticks([])
     ax.set_xticks([])
 
-    # Mark y* with a dashed line
+    # 标记 y*（虚线）
     y_star = -2.1
     ax.axvline(y_star, ls="--", lw=2, color="black")
     ax.text(y_star - 0.05, 0.02, r"$y^*$")
 
-    # Squeezing region annotation
+    # squeezing 区域注释
     ax.annotate(
         "squeezing",
         xy=(0.2, 0.25),
@@ -79,6 +79,7 @@ def plot_projection_schematic():
 
 
 def plot_discrete_candidates(data_dir):
+    # 离散候选集：同一组 response 上的对比
     df = pd.read_csv(data_dir / "discrete_candidates.csv")
     quality = df["quality"].to_numpy()
     logp0 = df["logp_pre"].to_numpy()
@@ -100,9 +101,9 @@ def plot_discrete_candidates(data_dir):
     idx = np.arange(len(p0))
     ax.vlines(idx - 0.12, 0, p0, color="gray", alpha=0.55, linewidth=2.2)
     ax.vlines(idx + 0.12, 0, pt, color="tab:blue", linewidth=2.2)
-    ax.set_title("Discrete Candidate Policy (same responses)")
-    ax.set_xlabel("Candidate response rank (sorted by quality)")
-    ax.set_ylabel("Probability mass")
+    ax.set_title("离散候选集策略（同一组 response）")
+    ax.set_xlabel("候选 response 排名（按质量排序）")
+    ax.set_ylabel("概率质量")
     ax.set_yticks([])
     ax.set_xticks([])
     ax.legend(["pre", "after"], frameon=False)
@@ -110,6 +111,7 @@ def plot_discrete_candidates(data_dir):
 
 
 def plot_semantic_projection(data_dir):
+    # 语义投影：将 response 投影到 1D 轴并做 KDE
     df = pd.read_csv(data_dir / "semantic_projection.csv")
     pre = df["z_pre"].to_numpy()
     post = df["z_post"].to_numpy()
@@ -121,7 +123,7 @@ def plot_semantic_projection(data_dir):
     fig, ax = plt.subplots(figsize=(9.5, 3.2))
     ax.plot(x, kde_pre, color="gray", lw=3, alpha=0.5, label="pre")
     ax.plot(x, kde_post, color="tab:blue", lw=3, label="after")
-    ax.set_title("Semantic Projection KDE (1D)")
+    ax.set_title("语义投影 KDE（一维）")
     ax.set_yticks([])
     ax.set_xticks([])
     ax.legend(frameon=False)
