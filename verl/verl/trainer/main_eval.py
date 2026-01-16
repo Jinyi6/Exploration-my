@@ -18,6 +18,7 @@ The input is a parquet file that contains N generated sequences and (optional) t
 """
 
 from collections import defaultdict
+from math import comb
 
 import hydra
 import numpy as np
@@ -26,6 +27,7 @@ import ray
 from tqdm import tqdm
 
 from verl.utils.fs import copy_to_local
+from verl.trainer.main_ppo import _select_rm_score_fn
 
 
 def get_custom_reward_fn(config):
@@ -67,8 +69,24 @@ def get_custom_reward_fn(config):
 @ray.remote
 def process_item(reward_fn, data_source, response_lst, reward_data):
     ground_truth = reward_data["ground_truth"]
-    score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
-    return data_source, np.mean(score_lst)
+    if reward_fn is None:
+        compute_score_fn = _select_rm_score_fn(data_source)
+        score_lst = [compute_score_fn(solution_str=r, ground_truth=ground_truth) for r in response_lst]
+    else:
+        score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
+    n = len(score_lst)
+    c = int(np.sum(np.array(score_lst) > 0))
+    passk_lst = []
+    for k in range(1, n):
+        if c == 0:
+            passk = 0.0
+        elif n - c < k:
+            passk = 1.0
+        else:
+            passk = 1 - comb(n - c, k) / comb(n, k)
+        passk_lst.append(passk)
+    avg32 = np.mean(score_lst[:32]) if n >= 32 else np.mean(score_lst)
+    return data_source, np.mean(score_lst), passk_lst, avg32
 
 
 @hydra.main(config_path="config", config_name="evaluation", version_base=None)
@@ -87,6 +105,8 @@ def main(config):
 
     # evaluate test_score based on data source
     data_source_reward = defaultdict(list)
+    data_source_passk = defaultdict(list)
+    data_source_avg32 = defaultdict(list)
     compute_score = get_custom_reward_fn(config)
 
     # Create remote tasks
@@ -98,13 +118,25 @@ def main(config):
             # Use ray.wait to get completed tasks
             done_ids, remote_tasks = ray.wait(remote_tasks)
             for result_id in done_ids:
-                data_source, score = ray.get(result_id)
+                data_source, score, passk_lst, avg32 = ray.get(result_id)
                 data_source_reward[data_source].append(score)
+                data_source_passk[data_source].append(passk_lst)
+                data_source_avg32[data_source].append(avg32)
                 pbar.update(1)
 
     metric_dict = {}
     for data_source, rewards in data_source_reward.items():
         metric_dict[f"test_score/{data_source}"] = np.mean(rewards)
+    for data_source, avg32_list in data_source_avg32.items():
+        metric_dict[f"test_avg@32/{data_source}"] = float(np.mean(avg32_list))
+    for data_source, passk_lists in data_source_passk.items():
+        if not passk_lists:
+            continue
+        max_len = max(len(lst) for lst in passk_lists)
+        for idx in range(max_len):
+            vals = [lst[idx] for lst in passk_lists if len(lst) > idx]
+            if vals:
+                metric_dict[f"test_pass@{idx + 1}/{data_source}"] = float(np.mean(vals))
 
     print(metric_dict)
 

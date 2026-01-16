@@ -372,8 +372,8 @@ class DataParallelPPOCritic(BasePPOCritic):
             if self.use_action_response_mask
             else attention_mask[:, -response_length - 1 : -1]
         )
-        if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
-            response_mask = attention_mask[:, -response_length:]
+        # if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
+        #     response_mask = attention_mask[:, -response_length:]
 
         # Distributional critic: always return risk-neutral expectation E[Z]
         # Non-distributional critic: pass through scalar values.
@@ -497,8 +497,8 @@ class DataParallelPPOCritic(BasePPOCritic):
                         if self.use_action_response_mask
                         else attention_mask[:, -response_length - 1 : -1]
                     )
-                    if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
-                        response_mask = attention_mask[:, -response_length:]
+                    # if self.is_distributional and (self.is_distributional_v2 or self.is_distributional_v3):
+                    #     response_mask = attention_mask[:, -response_length:]
 
                     vpreds = self._forward_micro_batch(data)
 
