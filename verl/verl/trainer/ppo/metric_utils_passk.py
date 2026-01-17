@@ -1,9 +1,9 @@
 # verl/trainer/ppo/metric_utils_passk.py
 
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # 在最上面
+import numpy as np
+import matplotlib.pyplot as plt
 import os
 import json
 from collections import defaultdict

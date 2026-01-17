@@ -77,7 +77,7 @@ def process_item(reward_fn, data_source, response_lst, reward_data):
     n = len(score_lst)
     c = int(np.sum(np.array(score_lst) > 0))
     passk_lst = []
-    for k in range(1, n):
+    for k in range(1, n + 1):
         if c == 0:
             passk = 0.0
         elif n - c < k:

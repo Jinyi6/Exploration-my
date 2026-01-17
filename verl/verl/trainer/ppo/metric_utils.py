@@ -119,8 +119,13 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
 
 def compute_data_metrics(batch, use_critic=True):
     # TODO: add response length
-    sequence_score = batch.batch['token_level_scores_backup'].sum(-1)
-    sequence_reward = batch.batch['token_level_scores_backup'].sum(-1)
+    if "token_level_scores_backup" in batch.meta_info:
+        score_backup = batch.meta_info["token_level_scores_backup"]
+        sequence_score = score_backup.sum(-1)
+        sequence_reward = score_backup.sum(-1)
+    else:
+        sequence_score = batch.batch["token_level_scores"].sum(-1)
+        sequence_reward = batch.batch["token_level_scores"].sum(-1)
 
     advantages = batch.batch['advantages']
     returns = batch.batch['returns']
