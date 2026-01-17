@@ -1412,9 +1412,7 @@ class RayPPOTrainer:
                     reward_reshaped = sum_reward_tensor.reshape(-1, rollout_n) # (batch, rollout_n)
                     reward_batch = reward_reshaped.sum(dim=1) /  rollout_n # (batch, )
                     
-                    batch.batch['responses_backup'] = batch.batch['responses'].clone()
-                    batch.batch['attn_backup'] = batch.batch['attention_mask'].clone()
-                    batch.batch['token_level_scores_backup'] = reward_tensor.clone()
+                    batch.meta_info["token_level_scores_backup"] = reward_tensor.detach().cpu()
                     
                     idx2score = []
                     solve_none = (reward_batch == 0).sum()
@@ -1691,6 +1689,7 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # batch.meta_info.pop("token_level_scores_backup", None)
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
