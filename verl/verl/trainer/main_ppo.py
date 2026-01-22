@@ -28,7 +28,7 @@ import os
 import ray
 import hydra
 from deepscaler.rewards.math_reward import deepscaler_reward_fn
-from verl.utils.reward_score import gsm8k, math
+from verl.utils.reward_score import gsm8k, math, countdown
 import torch
 # import os
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -40,6 +40,8 @@ def _select_rm_score_fn(data_source):
         return gsm8k.compute_score
     elif data_source == 'lighteval/MATH':
         return math.compute_score
+    elif data_source == "countdown":
+        return countdown.compute_score
     elif data_source == "locomo":
         return locomo.compute_score
     else:
