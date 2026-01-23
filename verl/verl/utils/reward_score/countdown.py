@@ -5,27 +5,18 @@ import operator
 
 def extract_solution(solution_str):
     """Extract the equation from the solution string."""
-    # Keep the original priority: strict parsing after "Assistant:" / "<|im_start|>assistant"
+    # Prefer explicit <answer> tags when present.
+    answer = _extract_answer_from_text(solution_str)
+    if answer is not None:
+        return answer
+
+    # Fallback to parsing content after Assistant markers, or the full string if absent.
     if "Assistant:" in solution_str:
         tail = solution_str.split("Assistant:", 1)[1]
     elif "<|im_start|>assistant" in solution_str:
         tail = solution_str.split("<|im_start|>assistant", 1)[1]
     else:
         tail = solution_str
-
-    strict_line = tail.split("\n")[-1]
-    answer = _extract_answer_from_text(strict_line)
-    if answer is not None:
-        return answer
-
-    answer = _extract_answer_from_text(tail)
-    if answer is not None:
-        return answer
-
-    if tail is not solution_str:
-        answer = _extract_answer_from_text(solution_str)
-        if answer is not None:
-            return answer
 
     return _extract_equation_fallback(tail)
 

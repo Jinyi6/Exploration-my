@@ -36,6 +36,7 @@ from verl import DataProto
 from verl.verl.utils.reward_score import locomo
 
 def _select_rm_score_fn(data_source):
+    # print("data_source", data_source)
     if data_source == 'openai/gsm8k':
         return gsm8k.compute_score
     elif data_source == 'lighteval/MATH':
